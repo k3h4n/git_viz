@@ -76,7 +76,13 @@ impl ObjectReader {
     }
 
     fn read_packed_object(&self, hash: &str) -> Result<GitObject> {
-        let hex_hash = hex_to_uint(hash)?;
+        let hash_bytes = hex::decode(hash).map_err(GitVizError::Parse)?;
+        if hash_bytes.len() != 20 {
+            return Err(GitVizError::InvalidFormat(format!(
+                "invalid object hash length: {}",
+                hash
+            )));
+        }
 
         if !self.pack_dir.exists() {
             return Err(GitVizError::ObjectNotFound(hash.to_string()));
@@ -88,8 +94,12 @@ impl ObjectReader {
             if path.extension().map(|e| e == "idx").unwrap_or(false) {
                 if let Some(idx_path) = path.to_str() {
                     let pack_path = idx_path.replace(".idx", ".pack");
-                    if let Ok(Some(obj)) =
-                        self.search_pack_file(&pack_path, idx_path, hex_hash, hash)
+                    if let Ok(Some(obj)) = self.search_pack_file(
+                        &pack_path,
+                        idx_path,
+                        &hash_bytes,
+                        hash,
+                    )
                     {
                         return Ok(obj);
                     }
@@ -104,13 +114,13 @@ impl ObjectReader {
         &self,
         pack_path: &str,
         idx_path: &str,
-        hex_hash: u64,
+        hash_bytes: &[u8],
         hash_str: &str,
     ) -> Result<Option<GitObject>> {
         let idx_data = std::fs::read(idx_path)?;
         let pack_data = std::fs::read(pack_path)?;
 
-        let offset = match self.find_in_index(&idx_data, hex_hash, hash_str) {
+        let offset = match self.find_in_index(&idx_data, hash_bytes) {
             Some(off) => off,
             None => return Ok(None),
         };
@@ -119,7 +129,7 @@ impl ObjectReader {
         Ok(Some(obj))
     }
 
-    fn find_in_index(&self, idx_data: &[u8], hash: u64, hash_str: &str) -> Option<u64> {
+    fn find_in_index(&self, idx_data: &[u8], hash_bytes: &[u8]) -> Option<u64> {
         if idx_data.len() < 8 {
             return None;
         }
@@ -134,7 +144,7 @@ impl ObjectReader {
         }
 
         let fanout_offset = 8;
-        let first_byte = hash_str.as_bytes().first().copied().unwrap_or(0);
+        let first_byte = *hash_bytes.first()?;
         let start = if first_byte == 0 {
             0u32
         } else {
@@ -168,9 +178,7 @@ impl ObjectReader {
                 continue;
             }
             let entry_hash = &idx_data[entry_offset..entry_offset + 20];
-            let entry_hex = hex::encode_upper(entry_hash);
-            let entry_uint = hex_to_uint(&entry_hex).ok()?;
-            if entry_uint == hash {
+            if entry_hash == hash_bytes {
                 let off_entry = offset_table_offset + (i as usize) * 4;
                 if off_entry + 4 > idx_data.len() {
                     return None;
@@ -220,7 +228,7 @@ impl ObjectReader {
             }
         };
 
-        let mut size = ((byte & 0x0F) as usize) << 3;
+        let mut size = (byte & 0x0F) as usize;
         let mut shift: usize = 4;
         let mut pos = offset + 1;
         let mut continue_bit = byte & 0x80 != 0;
@@ -249,32 +257,48 @@ impl ObjectReader {
 
     pub fn read_ref(&self, git_dir: &Path, ref_path: &str) -> Result<String> {
         let ref_file = git_dir.join(ref_path);
-        if !ref_file.exists() {
-            return Err(GitVizError::ObjectNotFound(ref_path.to_string()));
-        }
-        let content = std::fs::read_to_string(&ref_file)?;
+        let content = if ref_file.exists() {
+            std::fs::read_to_string(&ref_file)?
+        } else {
+            self.read_packed_ref(git_dir, ref_path)?
+        };
+
         let content = content.trim();
         if let Some(target) = content.strip_prefix("ref: ") {
             return self.read_ref(git_dir, target);
         }
+
         Ok(content.to_string())
     }
-}
 
-fn hex_to_uint(hex: &str) -> Result<u64> {
-    let bytes = hex::decode(hex).map_err(|e| GitVizError::Parse(e.to_string()))?;
-    let mut result: u64 = 0;
-    for &b in &bytes {
-        result = (result << 8) | (b as u64);
+    fn read_packed_ref(&self, git_dir: &Path, ref_path: &str) -> Result<String> {
+        let packed_refs_path = git_dir.join("packed-refs");
+        if !packed_refs_path.exists() {
+            return Err(GitVizError::ObjectNotFound(ref_path.to_string()));
+        }
+
+        let packed_refs = std::fs::read_to_string(packed_refs_path)?;
+        for line in packed_refs.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+
+            let mut parts = line.split_whitespace();
+            let hash = parts.next();
+            let name = parts.next();
+            if let (Some(hash), Some(name)) = (hash, name) {
+                if name == ref_path {
+                    return Ok(hash.to_string());
+                }
+            }
+        }
+
+        Err(GitVizError::ObjectNotFound(ref_path.to_string()))
     }
-    Ok(result)
 }
 
 mod hex {
-    pub fn encode_upper(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{:02X}", b)).collect()
-    }
-
     pub fn decode(hex: &str) -> std::result::Result<Vec<u8>, String> {
         if !hex.len().is_multiple_of(2) {
             return Err("hex string has odd length".into());
@@ -291,14 +315,26 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn create_temp_git_dir(test_name: &str) -> PathBuf {
+        let unique = format!(
+            "gitviz-test-{}-{}",
+            test_name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
-    fn test_hex_encode_decode() {
-        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let encoded = hex::encode_upper(&data);
-        assert_eq!(encoded, "DEADBEEF");
-        let decoded = hex::decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
+    fn test_hex_decode() {
+        let decoded = hex::decode("DEADBEEF").unwrap();
+        assert_eq!(decoded, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -319,8 +355,35 @@ mod tests {
     }
 
     #[test]
-    fn test_hex_to_uint() {
-        let val = hex_to_uint("FF").unwrap();
-        assert_eq!(val, 255);
+    fn test_read_ref_from_packed_refs() {
+        let git_dir = create_temp_git_dir("packed-refs");
+        std::fs::write(
+            git_dir.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled\n1234567890abcdef1234567890abcdef12345678 refs/heads/main\n",
+        )
+        .unwrap();
+
+        let reader = ObjectReader::new(&git_dir);
+        let hash = reader.read_ref(&git_dir, "refs/heads/main").unwrap();
+        assert_eq!(hash, "1234567890abcdef1234567890abcdef12345678");
+
+        let _ = std::fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn test_read_head_ref_resolves_to_packed_target() {
+        let git_dir = create_temp_git_dir("head-to-packed-ref");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            git_dir.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+
+        let reader = ObjectReader::new(&git_dir);
+        let hash = reader.read_ref(&git_dir, "HEAD").unwrap();
+        assert_eq!(hash, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let _ = std::fs::remove_dir_all(git_dir);
     }
 }

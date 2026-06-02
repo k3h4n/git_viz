@@ -83,6 +83,40 @@ impl GitRepository {
         Ok(branches)
     }
 
+    fn list_packed_head_refs(&self) -> Result<Vec<Branch>> {
+        let packed_refs_path = self.git_dir.join("packed-refs");
+        if !packed_refs_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let head_hash = self.get_head_hash().ok();
+        let mut branches = Vec::new();
+        let packed_refs = std::fs::read_to_string(packed_refs_path)?;
+
+        for line in packed_refs.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+
+            let mut parts = line.split_whitespace();
+            let commit_hash = parts.next();
+            let ref_name = parts.next();
+
+            if let (Some(commit_hash), Some(ref_name)) = (commit_hash, ref_name) {
+                if let Some(branch_name) = ref_name.strip_prefix("refs/heads/") {
+                    branches.push(Branch {
+                        name: branch_name.to_string(),
+                        commit_hash: commit_hash.to_string(),
+                        is_head: head_hash.as_deref() == Some(commit_hash),
+                    });
+                }
+            }
+        }
+
+        Ok(branches)
+    }
+
     pub fn collect_file_tree(
         &self,
         tree_hash: &str,
@@ -142,12 +176,22 @@ impl Repository for GitRepository {
         let heads_dir = self.git_dir.join("refs").join("heads");
         let mut branches = self.list_refs(&heads_dir, "")?;
 
+        let mut seen = std::collections::HashSet::new();
+        for branch in &branches {
+            seen.insert(branch.name.clone());
+        }
+
+        for branch in self.list_packed_head_refs()? {
+            if seen.insert(branch.name.clone()) {
+                branches.push(branch);
+            }
+        }
+
         let head_hash = self.get_head_hash().ok();
         let head_target = self.resolve_ref("HEAD").ok();
 
         if let Some(target) = &head_target {
-            let is_detached = !self.git_dir.join("refs").join("heads").exists()
-                || !branches.iter().any(|b| &b.commit_hash == target);
+            let is_detached = !branches.iter().any(|b| &b.commit_hash == target);
 
             if is_detached && !branches.iter().any(|b| b.name == "HEAD (detached)") {
                 branches.push(Branch {
