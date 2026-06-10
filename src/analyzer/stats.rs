@@ -85,7 +85,7 @@ fn build_contributor_stats(commits: &[Commit]) -> Vec<ContributorStats> {
     }
 
     let mut contributors: Vec<ContributorStats> = stats_map.into_values().collect();
-    contributors.sort_by_key(|b| std::cmp::Reverse(b.commit_count));
+    contributors.sort_by_key(|c| std::cmp::Reverse(c.commit_count));
     contributors
 }
 
