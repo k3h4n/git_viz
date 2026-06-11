@@ -12,15 +12,29 @@ use crate::models::git_object::{
 
 pub struct GitRepository {
     git_dir: PathBuf,
+    common_dir: PathBuf,
     reader: ObjectReader,
 }
 
 impl GitRepository {
     pub fn open(path: &Path) -> Result<Self> {
-        let git_dir = if path.join(".git").exists() {
-            path.join(".git")
+        let dot_git = path.join(".git");
+        let git_dir = if dot_git.is_dir() {
+            dot_git
+        } else if dot_git.is_file() {
+            resolve_gitdir_file(path, &dot_git)?
         } else if path.file_name().map(|n| n == ".git").unwrap_or(false) {
-            path.to_path_buf()
+            if path.is_file() {
+                let parent = path.parent().ok_or_else(|| {
+                    GitVizError::InvalidFormat(format!(
+                        "cannot resolve parent for {}",
+                        path.display()
+                    ))
+                })?;
+                resolve_gitdir_file(parent, path)?
+            } else {
+                path.to_path_buf()
+            }
         } else {
             return Err(GitVizError::NotAGitRepo(path.display().to_string()));
         };
@@ -29,8 +43,14 @@ impl GitRepository {
             return Err(GitVizError::NotAGitRepo(path.display().to_string()));
         }
 
-        let reader = ObjectReader::new(&git_dir);
-        Ok(GitRepository { git_dir, reader })
+        let common_dir = resolve_common_dir(&git_dir)?;
+        let reader = ObjectReader::new(&git_dir, &common_dir);
+
+        Ok(GitRepository {
+            git_dir,
+            common_dir,
+            reader,
+        })
     }
 
     pub fn git_dir(&self) -> &Path {
@@ -46,7 +66,8 @@ impl GitRepository {
     }
 
     fn resolve_ref(&self, ref_path: &str) -> Result<String> {
-        self.reader.read_ref(&self.git_dir, ref_path)
+        self.reader
+            .read_ref(&self.git_dir, &self.common_dir, ref_path)
     }
 
     pub fn get_head_hash(&self) -> Result<String> {
@@ -68,7 +89,7 @@ impl GitRepository {
                 let sub_prefix = format!("{}/", full_name);
                 branches.extend(self.list_refs(&entry.path(), &sub_prefix)?);
             } else {
-                let commit_hash = self.resolve_ref(&format!("refs/{}", full_name))?;
+                let commit_hash = self.resolve_ref(&format!("refs/heads/{}", full_name))?;
                 let head_hash = self.get_head_hash().ok();
                 let is_head = head_hash.as_deref() == Some(commit_hash.as_str());
 
@@ -84,7 +105,7 @@ impl GitRepository {
     }
 
     fn list_packed_head_refs(&self) -> Result<Vec<Branch>> {
-        let packed_refs_path = self.git_dir.join("packed-refs");
+        let packed_refs_path = self.common_dir.join("packed-refs");
         if !packed_refs_path.exists() {
             return Ok(Vec::new());
         }
@@ -173,7 +194,7 @@ impl Repository for GitRepository {
     }
 
     fn get_branches(&self) -> Result<Vec<Branch>> {
-        let heads_dir = self.git_dir.join("refs").join("heads");
+        let heads_dir = self.common_dir.join("refs").join("heads");
         let mut branches = self.list_refs(&heads_dir, "")?;
 
         let mut seen = std::collections::HashSet::new();
@@ -246,6 +267,41 @@ impl Repository for GitRepository {
         }
 
         Ok(commits)
+    }
+}
+
+fn resolve_gitdir_file(repo_root: &Path, git_file: &Path) -> Result<PathBuf> {
+    let content = std::fs::read_to_string(git_file)?;
+    let line = content.lines().next().unwrap_or("").trim();
+    let rel = line.strip_prefix("gitdir:").map(str::trim).ok_or_else(|| {
+        GitVizError::InvalidFormat(format!("invalid .git file format: {}", git_file.display()))
+    })?;
+
+    let candidate = PathBuf::from(rel);
+    if candidate.is_absolute() {
+        Ok(candidate)
+    } else {
+        Ok(repo_root.join(candidate))
+    }
+}
+
+fn resolve_common_dir(git_dir: &Path) -> Result<PathBuf> {
+    let commondir_file = git_dir.join("commondir");
+    if !commondir_file.exists() {
+        return Ok(git_dir.to_path_buf());
+    }
+
+    let rel = std::fs::read_to_string(&commondir_file)?;
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Ok(git_dir.to_path_buf());
+    }
+
+    let path = PathBuf::from(rel);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(git_dir.join(path))
     }
 }
 

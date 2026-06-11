@@ -1,19 +1,22 @@
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::models::git_object::{GitObject, GitObjectType, GitVizError, Result};
 
 pub struct ObjectReader {
+    git_dir: PathBuf,
     objects_dir: PathBuf,
     pack_dir: PathBuf,
 }
 
 impl ObjectReader {
-    pub fn new(git_dir: &Path) -> Self {
+    pub fn new(git_dir: &Path, common_dir: &Path) -> Self {
         ObjectReader {
-            objects_dir: git_dir.join("objects"),
-            pack_dir: git_dir.join("objects").join("pack"),
+            git_dir: git_dir.to_path_buf(),
+            objects_dir: common_dir.join("objects"),
+            pack_dir: common_dir.join("objects").join("pack"),
         }
     }
 
@@ -32,7 +35,71 @@ impl ObjectReader {
             return self.read_loose_object(&loose_path, hash);
         }
 
-        self.read_packed_object(hash)
+        match self.read_packed_object(hash) {
+            Ok(obj) => Ok(obj),
+            Err(_) => self.read_object_via_git(hash),
+        }
+    }
+
+    fn read_object_via_git(&self, hash: &str) -> Result<GitObject> {
+        let type_output = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("cat-file")
+            .arg("-t")
+            .arg(hash)
+            .output()?;
+
+        if !type_output.status.success() {
+            return Err(GitVizError::ObjectNotFound(hash.to_string()));
+        }
+
+        let type_str = String::from_utf8_lossy(&type_output.stdout).trim().to_string();
+        let obj_type: GitObjectType = type_str
+            .parse()
+            .map_err(|_| GitVizError::InvalidFormat(format!("unknown type: {}", type_str)))?;
+
+        let size_output = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("cat-file")
+            .arg("-s")
+            .arg(hash)
+            .output()?;
+
+        if !size_output.status.success() {
+            return Err(GitVizError::InvalidFormat(format!(
+                "failed to read object size for {}",
+                hash
+            )));
+        }
+
+        let size_str = String::from_utf8_lossy(&size_output.stdout).trim().to_string();
+        let size: usize = size_str
+            .parse()
+            .map_err(|_| GitVizError::InvalidFormat(format!("invalid size: {}", size_str)))?;
+
+        let content_output = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("cat-file")
+            .arg(type_str.as_str())
+            .arg(hash)
+            .output()?;
+
+        if !content_output.status.success() {
+            return Err(GitVizError::InvalidFormat(format!(
+                "failed to read object content for {}",
+                hash
+            )));
+        }
+
+        Ok(GitObject {
+            obj_type,
+            hash: hash.to_string(),
+            size,
+            content: content_output.stdout,
+        })
     }
 
     fn read_loose_object(&self, path: &Path, hash: &str) -> Result<GitObject> {
@@ -255,41 +322,46 @@ impl ObjectReader {
         })
     }
 
-    pub fn read_ref(&self, git_dir: &Path, ref_path: &str) -> Result<String> {
+    pub fn read_ref(&self, git_dir: &Path, common_dir: &Path, ref_path: &str) -> Result<String> {
         let ref_file = git_dir.join(ref_path);
+        let common_ref_file = common_dir.join(ref_path);
+
         let content = if ref_file.exists() {
             std::fs::read_to_string(&ref_file)?
+        } else if common_ref_file.exists() {
+            std::fs::read_to_string(&common_ref_file)?
         } else {
-            self.read_packed_ref(git_dir, ref_path)?
+            self.read_packed_ref(git_dir, common_dir, ref_path)?
         };
 
         let content = content.trim();
         if let Some(target) = content.strip_prefix("ref: ") {
-            return self.read_ref(git_dir, target);
+            return self.read_ref(git_dir, common_dir, target);
         }
 
         Ok(content.to_string())
     }
 
-    fn read_packed_ref(&self, git_dir: &Path, ref_path: &str) -> Result<String> {
-        let packed_refs_path = git_dir.join("packed-refs");
-        if !packed_refs_path.exists() {
-            return Err(GitVizError::ObjectNotFound(ref_path.to_string()));
-        }
-
-        let packed_refs = std::fs::read_to_string(packed_refs_path)?;
-        for line in packed_refs.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+    fn read_packed_ref(&self, git_dir: &Path, common_dir: &Path, ref_path: &str) -> Result<String> {
+        for packed_refs_path in [git_dir.join("packed-refs"), common_dir.join("packed-refs")] {
+            if !packed_refs_path.exists() {
                 continue;
             }
 
-            let mut parts = line.split_whitespace();
-            let hash = parts.next();
-            let name = parts.next();
-            if let (Some(hash), Some(name)) = (hash, name) {
-                if name == ref_path {
-                    return Ok(hash.to_string());
+            let packed_refs = std::fs::read_to_string(packed_refs_path)?;
+            for line in packed_refs.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+
+                let mut parts = line.split_whitespace();
+                let hash = parts.next();
+                let name = parts.next();
+                if let (Some(hash), Some(name)) = (hash, name) {
+                    if name == ref_path {
+                        return Ok(hash.to_string());
+                    }
                 }
             }
         }

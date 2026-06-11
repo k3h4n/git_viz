@@ -29,6 +29,9 @@ struct Cli {
 
     #[arg(short, long, default_value = ".")]
     path: PathBuf,
+
+    #[arg(long, help = "Run analysis only and print counts without launching TUI")]
+    no_tui: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +68,32 @@ fn main() -> anyhow::Result<()> {
         "Found {} commits, {} contributors",
         commits_count, contributors_count
     );
+
+    if cli.no_tui {
+        println!("overview.commits={}", commits_count);
+        println!("overview.contributors={}", contributors_count);
+        println!(
+            "overview.branches={}",
+            analysis
+                .overview
+                .as_ref()
+                .map(|o| o.total_branches)
+                .unwrap_or(0)
+        );
+        println!("timeline.entries={}", analysis.timeline.len());
+        println!("contributors.entries={}", analysis.contributors.len());
+        println!("hotspots.entries={}", analysis.hotspots.len());
+        println!(
+            "branches.entries={}",
+            analysis
+                .branch_graph
+                .as_ref()
+                .map(|b| b.branches.len())
+                .unwrap_or(0)
+        );
+        return Ok(());
+    }
+
     eprintln!("Launching TUI...");
 
     run_tui(analysis, repo_path.to_string_lossy().to_string())?;
